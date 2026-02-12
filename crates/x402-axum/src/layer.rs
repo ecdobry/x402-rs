@@ -69,7 +69,7 @@ use x402_types::facilitator::Facilitator;
 use crate::facilitator_client::FacilitatorClient;
 use crate::paygate::{
     DynamicPriceTags, Paygate, PaygateProtocol, PriceTagSource, ResourceInfoBuilder,
-    StaticPriceTags,
+    SettlementMode, StaticPriceTags,
 };
 
 /// The main X402 middleware instance for enforcing x402 payments on routes.
@@ -80,7 +80,7 @@ use crate::paygate::{
 pub struct X402Middleware<F> {
     facilitator: F,
     base_url: Option<Url>,
-    settle_before_execution: bool,
+    settlement_mode: SettlementMode,
 }
 
 impl<F> X402Middleware<F> {
@@ -100,7 +100,7 @@ impl X402Middleware<Arc<FacilitatorClient>> {
         Self {
             facilitator: Arc::new(facilitator),
             base_url: None,
-            settle_before_execution: false,
+            settlement_mode: SettlementMode::default(),
         }
     }
 
@@ -110,7 +110,7 @@ impl X402Middleware<Arc<FacilitatorClient>> {
         Ok(Self {
             facilitator: Arc::new(facilitator),
             base_url: None,
-            settle_before_execution: false,
+            settlement_mode: SettlementMode::default(),
         })
     }
 
@@ -128,7 +128,7 @@ impl X402Middleware<Arc<FacilitatorClient>> {
         Self {
             facilitator,
             base_url: self.base_url.clone(),
-            settle_before_execution: self.settle_before_execution,
+            settlement_mode: self.settlement_mode,
         }
     }
 }
@@ -169,7 +169,7 @@ where
     /// When disabled (default), settlement occurs after successful request execution.
     pub fn settle_before_execution(&self) -> X402Middleware<F> {
         let mut this = self.clone();
-        this.settle_before_execution = true;
+        this.settlement_mode = SettlementMode::BeforeExecution;
         this
     }
 
@@ -180,7 +180,16 @@ where
     /// the request before committing the payment on-chain.
     pub fn settle_after_execution(&self) -> Self {
         let mut this = self.clone();
-        this.settle_before_execution = false;
+        this.settlement_mode = SettlementMode::AfterExecution;
+        this
+    }
+
+    /// Enables verify-only mode: the middleware verifies the payment but does
+    /// **not** settle it. Instead, a [`crate::paygate::VerifiedPayment`] is
+    /// inserted into the request extensions so the handler can settle later.
+    pub fn verify_only(&self) -> Self {
+        let mut this = self.clone();
+        this.settlement_mode = SettlementMode::VerifyOnly;
         this
     }
 }
@@ -202,7 +211,7 @@ where
             price_source: StaticPriceTags::new(vec![price_tag]),
             base_url: self.base_url.clone().map(Arc::new),
             resource: Arc::new(ResourceInfoBuilder::default()),
-            settle_before_execution: self.settle_before_execution,
+            settlement_mode: self.settlement_mode,
         }
     }
 
@@ -245,7 +254,7 @@ where
             price_source: DynamicPriceTags::new(callback),
             base_url: self.base_url.clone().map(Arc::new),
             resource: Arc::new(ResourceInfoBuilder::default()),
-            settle_before_execution: self.settle_before_execution,
+            settlement_mode: self.settlement_mode,
         }
     }
 }
@@ -257,7 +266,7 @@ where
 #[derive(Clone)]
 pub struct X402LayerBuilder<TSource, TFacilitator> {
     facilitator: TFacilitator,
-    settle_before_execution: bool,
+    settlement_mode: SettlementMode,
     base_url: Option<Arc<Url>>,
     price_source: TSource,
     resource: Arc<ResourceInfoBuilder>,
@@ -323,7 +332,7 @@ where
     fn layer(&self, inner: S) -> Self::Service {
         X402MiddlewareService {
             facilitator: self.facilitator.clone(),
-            settle_before_execution: self.settle_before_execution,
+            settlement_mode: self.settlement_mode,
             base_url: self.base_url.clone(),
             price_source: self.price_source.clone(),
             resource: self.resource.clone(),
@@ -342,8 +351,8 @@ pub struct X402MiddlewareService<TSource, TFacilitator> {
     facilitator: TFacilitator,
     /// Base URL for constructing resource URLs
     base_url: Option<Arc<Url>>,
-    /// Whether to settle payment before executing the request (true) or after (false)
-    settle_before_execution: bool,
+    /// When to settle the payment relative to request execution
+    settlement_mode: SettlementMode,
     /// Price tag source - can be static or dynamic
     price_source: TSource,
     /// Resource information
@@ -373,7 +382,7 @@ where
         let facilitator = self.facilitator.clone();
         let base_url = self.base_url.clone();
         let resource_builder = self.resource.clone();
-        let settle_before_execution = self.settle_before_execution;
+        let settlement_mode = self.settlement_mode;
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
@@ -392,7 +401,7 @@ where
             let gate = {
                 let mut gate = Paygate {
                     facilitator,
-                    settle_before_execution,
+                    settlement_mode,
                     accepts: Arc::new(accepts),
                     resource,
                 };

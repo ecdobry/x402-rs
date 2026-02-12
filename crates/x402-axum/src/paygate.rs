@@ -20,7 +20,7 @@
 //! // Create a paygate for V1 or V2 protocol
 //! let paygate = Paygate {
 //!     facilitator,
-//!     settle_before_execution: false,
+//!     settlement_mode: SettlementMode::default(),
 //!     accepts: Arc::new(price_tags),
 //!     resource: ResourceInfoBuilder::default().as_resource_info(&base_url, &uri),
 //! };
@@ -49,6 +49,45 @@ use tracing::Instrument;
 #[cfg(feature = "telemetry")]
 use tracing::instrument;
 use x402_types::util::Base64Bytes;
+
+// ============================================================================
+// Settlement Mode & Verified Payment
+// ============================================================================
+
+/// Controls when payment settlement occurs relative to request execution.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SettlementMode {
+    /// Settle the payment before executing the handler.
+    BeforeExecution,
+    /// Settle the payment after executing the handler (default).
+    #[default]
+    AfterExecution,
+    /// Only verify the payment; do not settle. The caller is responsible for
+    /// settling later via the [`VerifiedPayment`] inserted into request extensions.
+    VerifyOnly,
+}
+
+/// A verified-but-not-yet-settled payment.
+///
+/// When [`SettlementMode::VerifyOnly`] is active, the middleware inserts this
+/// into the request extensions so the handler (or a background task) can settle
+/// later by calling `facilitator.settle(verified.settle_request())`.
+#[derive(Debug, Clone)]
+pub struct VerifiedPayment {
+    settle_request: proto::SettleRequest,
+}
+
+impl VerifiedPayment {
+    /// Returns a reference to the underlying settle request.
+    pub fn settle_request(&self) -> &proto::SettleRequest {
+        &self.settle_request
+    }
+
+    /// Consumes self and returns the settle request.
+    pub fn into_settle_request(self) -> proto::SettleRequest {
+        self.settle_request
+    }
+}
 
 // ============================================================================
 // Common Types
@@ -404,8 +443,8 @@ impl PaygateProtocol for v2::PriceTag {
 pub struct Paygate<TPriceTag, TFacilitator> {
     /// The facilitator for verifying and settling payments
     pub facilitator: TFacilitator,
-    /// Whether to settle before or after request execution
-    pub settle_before_execution: bool,
+    /// When to settle the payment relative to request execution
+    pub settlement_mode: SettlementMode,
     /// Accepted payment requirements
     pub accepts: Arc<Vec<TPriceTag>>,
     /// Resource information for the protected endpoint
@@ -507,7 +546,7 @@ where
     >(
         &self,
         inner: S,
-        req: http::Request<ReqBody>,
+        mut req: http::Request<ReqBody>,
     ) -> Result<Response, PaygateError>
     where
         S::Response: IntoResponse,
@@ -524,50 +563,75 @@ where
         let verify_request =
             TPriceTag::make_verify_request(payment_payload, &self.accepts, &self.resource)?;
 
-        if self.settle_before_execution {
-            // Settlement before execution: settle payment first, then call inner handler
-            #[cfg(feature = "telemetry")]
-            tracing::debug!("Settling payment before request execution");
+        match self.settlement_mode {
+            SettlementMode::BeforeExecution => {
+                // Settlement before execution: settle payment first, then call inner handler
+                #[cfg(feature = "telemetry")]
+                tracing::debug!("Settling payment before request execution");
 
-            let settlement = self.settle_payment(&verify_request).await?;
+                let settlement = self.settle_payment(&verify_request).await?;
 
-            let header_value = settlement_to_header(settlement)?;
+                let header_value = settlement_to_header(settlement)?;
 
-            // Settlement succeeded, now execute the request
-            let response = match Self::call_inner(inner, req).await {
-                Ok(response) => response,
-                Err(err) => return Ok(err.into_response()),
-            };
+                // Settlement succeeded, now execute the request
+                let response = match Self::call_inner(inner, req).await {
+                    Ok(response) => response,
+                    Err(err) => return Ok(err.into_response()),
+                };
 
-            // Add payment response header
-            let mut res = response;
-            res.headers_mut().insert("X-Payment-Response", header_value);
-            Ok(res.into_response())
-        } else {
-            // Settlement after execution (default): call inner handler first, then settle
-            #[cfg(feature = "telemetry")]
-            tracing::debug!("Settling payment after request execution");
-
-            let verify_response = self.verify_payment(&verify_request).await?;
-
-            TPriceTag::validate_verify_response(verify_response)?;
-
-            let response = match Self::call_inner(inner, req).await {
-                Ok(response) => response,
-                Err(err) => return Ok(err.into_response()),
-            };
-
-            if response.status().is_client_error() || response.status().is_server_error() {
-                return Ok(response.into_response());
+                // Add payment response header
+                let mut res = response;
+                res.headers_mut().insert("X-Payment-Response", header_value);
+                Ok(res.into_response())
             }
+            SettlementMode::AfterExecution => {
+                // Settlement after execution (default): call inner handler first, then settle
+                #[cfg(feature = "telemetry")]
+                tracing::debug!("Settling payment after request execution");
 
-            let settlement = self.settle_payment(&verify_request).await?;
+                let verify_response = self.verify_payment(&verify_request).await?;
 
-            let header_value = settlement_to_header(settlement)?;
+                TPriceTag::validate_verify_response(verify_response)?;
 
-            let mut res = response;
-            res.headers_mut().insert("X-Payment-Response", header_value);
-            Ok(res.into_response())
+                let response = match Self::call_inner(inner, req).await {
+                    Ok(response) => response,
+                    Err(err) => return Ok(err.into_response()),
+                };
+
+                if response.status().is_client_error() || response.status().is_server_error() {
+                    return Ok(response.into_response());
+                }
+
+                let settlement = self.settle_payment(&verify_request).await?;
+
+                let header_value = settlement_to_header(settlement)?;
+
+                let mut res = response;
+                res.headers_mut().insert("X-Payment-Response", header_value);
+                Ok(res.into_response())
+            }
+            SettlementMode::VerifyOnly => {
+                // Verify-only mode: verify payment, inject VerifiedPayment, call handler, skip settlement
+                #[cfg(feature = "telemetry")]
+                tracing::debug!("Verify-only mode: verifying payment without settlement");
+
+                let verify_response = self.verify_payment(&verify_request).await?;
+
+                TPriceTag::validate_verify_response(verify_response)?;
+
+                let verified = VerifiedPayment {
+                    settle_request: verify_request,
+                };
+
+                req.extensions_mut().insert(verified);
+
+                let response = match Self::call_inner(inner, req).await {
+                    Ok(response) => response,
+                    Err(err) => return Ok(err.into_response()),
+                };
+
+                Ok(response.into_response())
+            }
         }
     }
 

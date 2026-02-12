@@ -108,5 +108,9 @@ pub mod facilitator_client;
 pub mod layer;
 pub mod paygate;
 
+pub use facilitator_client::FacilitatorClient;
 pub use layer::{X402LayerBuilder, X402Middleware};
-pub use paygate::{DynamicPriceTags, PaygateProtocol, PriceTagSource, StaticPriceTags};
+pub use paygate::{
+    DynamicPriceTags, PaygateProtocol, PriceTagSource, SettlementMode, StaticPriceTags,
+    VerifiedPayment,
+};
